@@ -1,0 +1,9 @@
+[package]
+name = "watcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+notify = "8.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
