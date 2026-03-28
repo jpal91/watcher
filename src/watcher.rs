@@ -3,12 +3,12 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
-    thread,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use glob::glob;
+use log::{error, info, trace};
 use notify::{Event, EventHandler, RecommendedWatcher, RecursiveMode, Watcher};
 use uuid::Uuid;
 
@@ -28,7 +28,7 @@ impl WatchFiles {
             let notifier = match self.start_one(item) {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("{}", e);
+                    error!("{}", e);
                     continue;
                 }
             };
@@ -37,33 +37,39 @@ impl WatchFiles {
         }
 
         loop {
+            if let Ok(id) = self.rx.recv_timeout(Duration::from_secs(1)) {
+                // Definitely exists
+                let watch = self.watch_map.get_mut(&id).unwrap();
+                let now = Instant::now();
+
+                watch.last_send = Some(now);
+
+                trace!("Event for '{}'", watch.name);
+
+                continue;
+            }
+
             for watcher in self.watch_map.values_mut() {
                 let now = Instant::now();
 
                 if let Some(last) = watcher.last_send
                     && now >= last + Duration::from_millis(watcher.debounce)
                 {
+                    info!("Command ran for '{}'", watcher.name);
+
                     if let Err(e) = run_command(watcher) {
-                        eprintln!("{}", e);
+                        error!("{}", e);
                     }
 
                     watcher.last_send = None;
                 }
             }
-
-            while let Ok(id) = self.rx.try_recv() {
-                // Definitely exists
-                let watch = self.watch_map.get_mut(&id).unwrap();
-                let now = Instant::now();
-
-                watch.last_send = Some(now);
-            }
-
-            thread::sleep(Duration::from_secs(1));
         }
     }
 
     fn start_one(&mut self, item: WatchItem) -> Result<RecommendedWatcher> {
+        trace!("Starting '{}'", item.name);
+
         let paths = get_all_paths(&item)?;
         let watcher = ActiveWatcher::new(&item);
         let id = Uuid::new_v4();
@@ -137,7 +143,7 @@ impl EventHandler for WatchEventHandler {
                     self.sx.send(self.id).unwrap();
                 }
             }
-            Err(e) => eprintln!("{}", e),
+            Err(e) => error!("{}", e),
         }
     }
 }
@@ -187,7 +193,10 @@ fn run_command(watcher: &ActiveWatcher) -> Result<()> {
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
 
-    println!("{}\n{}\n{}", &watcher.name, stdout, stderr);
+    trace!(
+        "\nNAME: '{}'\nSTDOUT:\n{}\nSTDERR:\n{}",
+        &watcher.name, stdout, stderr
+    );
 
     Ok(())
 }

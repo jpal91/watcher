@@ -34,15 +34,18 @@ pub struct WatchItem {
     pub ignore: Option<YamlChoice>,
     #[serde(default)]
     pub events: EventFlags,
-    #[serde(deserialize_with = "deserialize_debounce")]
+    #[serde(
+        default = "default_debounce",
+        deserialize_with = "deserialize_debounce"
+    )]
     pub debounce: u64,
 }
 
 pub type WatchCommands = Vec<WatchItem>;
 
-// fn default_debounce() -> f64 {
-//     100.0
-// }
+fn default_debounce() -> u64 {
+    100
+}
 
 fn deserialize_debounce<'de, D>(de: D) -> Result<u64, D::Error>
 where

@@ -1,1 +1,4 @@
 /target
+test_config.yml
+watcher_config.yml
+watcher_log*
