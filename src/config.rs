@@ -29,6 +29,7 @@ pub struct WatchItem {
     pub name: String,
     pub watch: YamlChoice,
     pub run: YamlChoice,
+    pub ignore: Option<YamlChoice>,
 }
 
 pub type WatchCommands = Vec<WatchItem>;
