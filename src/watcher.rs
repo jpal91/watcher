@@ -1,49 +1,95 @@
-use std::{collections::HashSet, path::PathBuf, process::Command, thread, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    process::Command,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use glob::glob;
-use notify::{Event, EventHandler, EventKind, RecursiveMode, Watcher};
+use notify::{Event, EventHandler, RecommendedWatcher, RecursiveMode, Watcher};
+use uuid::Uuid;
 
-use crate::config::{WatchCommands, WatchItem, YamlChoice};
+use crate::config::{EventFlags, WatchCommands, WatchItem, YamlChoice};
 
-pub struct WatchFiles;
+pub struct WatchFiles {
+    watch_map: HashMap<Uuid, ActiveWatcher>,
+    sx: Sender<Uuid>,
+    rx: Receiver<Uuid>,
+}
 
 impl WatchFiles {
-    pub fn start(items: WatchCommands) -> Result<()> {
+    pub fn start(&mut self, items: WatchCommands) -> Result<()> {
         let mut watchers = vec![];
 
         for item in items {
-            let paths = match get_all_paths(&item) {
-                Ok(p) => p,
+            let notifier = match self.start_one(item) {
+                Ok(n) => n,
                 Err(e) => {
                     eprintln!("{}", e);
                     continue;
                 }
             };
 
-            match ActiveWatcher::new(item) {
-                Ok(w) => {
-                    let mut watcher = match notify::recommended_watcher(w) {
-                        Ok(w) => w,
-                        Err(e) => {
-                            eprintln!("{}", e);
-                            continue;
-                        }
-                    };
-
-                    for path in paths {
-                        let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
-                    }
-
-                    watchers.push(watcher);
-                }
-                Err(e) => eprintln!("{}", e),
-            };
+            watchers.push(notifier);
         }
 
         loop {
-            println!("Tick");
+            for watcher in self.watch_map.values_mut() {
+                let now = Instant::now();
+
+                if let Some(last) = watcher.last_send
+                    && now >= last + Duration::from_millis(watcher.debounce)
+                {
+                    if let Err(e) = run_command(watcher) {
+                        eprintln!("{}", e);
+                    }
+
+                    watcher.last_send = None;
+                }
+            }
+
+            while let Ok(id) = self.rx.try_recv() {
+                // Definitely exists
+                let watch = self.watch_map.get_mut(&id).unwrap();
+                let now = Instant::now();
+
+                watch.last_send = Some(now);
+            }
+
             thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    fn start_one(&mut self, item: WatchItem) -> Result<RecommendedWatcher> {
+        let paths = get_all_paths(&item)?;
+        let watcher = ActiveWatcher::new(&item);
+        let id = Uuid::new_v4();
+
+        let handler = WatchEventHandler::new(id, item.events, self.sx.clone());
+
+        self.watch_map.insert(id, watcher);
+
+        let mut notifier = notify::recommended_watcher(handler)?;
+
+        for path in paths {
+            notifier.watch(&path, RecursiveMode::NonRecursive)?;
+        }
+
+        Ok(notifier)
+    }
+}
+
+impl Default for WatchFiles {
+    fn default() -> Self {
+        let (sx, rx) = mpsc::channel();
+
+        Self {
+            watch_map: HashMap::new(),
+            sx,
+            rx,
         }
     }
 }
@@ -51,40 +97,46 @@ impl WatchFiles {
 pub struct ActiveWatcher {
     pub name: String,
     pub cmd: String,
+    last_send: Option<Instant>,
+    debounce: u64,
 }
 
 impl ActiveWatcher {
-    pub fn new(item: WatchItem) -> Result<Self> {
+    fn new(item: &WatchItem) -> Self {
         let cmd = item.run.to_string();
+        let name = item.name.clone();
 
-        Ok(Self {
-            name: item.name,
+        Self {
             cmd,
-        })
+            name,
+            last_send: None,
+            debounce: item.debounce,
+        }
     }
 }
 
-impl EventHandler for ActiveWatcher {
+pub struct WatchEventHandler {
+    pub id: Uuid,
+    pub flags: EventFlags,
+    pub sx: Sender<Uuid>,
+}
+
+impl WatchEventHandler {
+    pub fn new(id: Uuid, flags: EventFlags, sx: Sender<Uuid>) -> Self {
+        Self { id, flags, sx }
+    }
+}
+
+impl EventHandler for WatchEventHandler {
     fn handle_event(&mut self, event: notify::Result<Event>) {
         match event {
-            Ok(Event {
-                kind: EventKind::Modify(_),
-                ..
-            }) => {
-                let out = Command::new("sh").args(["-c", &self.cmd]).output();
+            Ok(Event { kind, .. }) => {
+                let flag = EventFlags::from(kind);
 
-                match out {
-                    Ok(o) => {
-                        let msg = match String::from_utf8(o.stdout) {
-                            Ok(m) => m,
-                            Err(e) => return eprintln!("{}", e),
-                        };
-                        println!("{msg}");
-                    }
-                    Err(e) => eprintln!("{}", e),
+                if self.flags.intersects(flag) {
+                    self.sx.send(self.id).unwrap();
                 }
             }
-            Ok(_) => {}
             Err(e) => eprintln!("{}", e),
         }
     }
@@ -125,6 +177,17 @@ fn get_single_path(item: &str, paths: &mut HashSet<PathBuf>) -> Result<()> {
         let path = path?;
         paths.insert(path);
     }
+
+    Ok(())
+}
+
+fn run_command(watcher: &ActiveWatcher) -> Result<()> {
+    let output = Command::new("sh").args(["-c", &watcher.cmd]).output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    println!("{}\n{}\n{}", &watcher.name, stdout, stderr);
 
     Ok(())
 }
