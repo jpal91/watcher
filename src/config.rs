@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, path::PathBuf};
 
 use bitflags::bitflags;
 use notify::EventKind;
@@ -32,6 +32,7 @@ pub struct WatchItem {
     pub watch: YamlChoice,
     pub run: YamlChoice,
     pub ignore: Option<YamlChoice>,
+    pub base_path: Option<PathBuf>,
     #[serde(default)]
     pub events: EventFlags,
     #[serde(
