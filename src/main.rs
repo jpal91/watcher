@@ -8,7 +8,7 @@ use flexi_logger::{
 use log::{info, warn};
 use watcher_lib::{
     config::{EventFlags, WatchCommands, WatchItem, YamlChoice},
-    watcher2::WatchFiles,
+    watcher::WatchFiles,
 };
 
 fn main() -> Result<()> {

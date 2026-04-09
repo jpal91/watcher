@@ -7,18 +7,20 @@ use std::{
 };
 
 use anyhow::Result;
-use glob::glob;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::gitignore::Gitignore;
 use log::{error, info, trace};
 use notify::{Event, EventHandler, RecommendedWatcher, RecursiveMode, Watcher};
 use uuid::Uuid;
 
-use crate::config::{EventFlags, WatchCommands, WatchItem, YamlChoice};
+use crate::config::{EventFlags, WatchCommands, WatchItem, is_ignored};
 
-type WatchEvent = (Uuid, Vec<PathBuf>);
+struct WatchEvent {
+    id: Uuid,
+    paths: Vec<PathBuf>,
+}
 
 pub struct WatchFiles {
-    watch_map: HashMap<Uuid, ActiveWatcher>,
+    watch_map: HashMap<Uuid, WatchCommandRunner>,
     sx: Sender<WatchEvent>,
     rx: Receiver<WatchEvent>,
 }
@@ -40,13 +42,22 @@ impl WatchFiles {
         }
 
         loop {
-            if let Ok((id, paths)) = self.rx.recv_timeout(Duration::from_secs(1)) {
+            if let Ok(WatchEvent { id, paths }) = self.rx.recv_timeout(Duration::from_secs(1)) {
                 // Definitely exists
                 let watch = self.watch_map.get_mut(&id).unwrap();
                 let now = Instant::now();
 
                 watch.last_send = Some(now);
-                watch.files.extend(paths);
+
+                for path in paths {
+                    if let Some(ref g_ignore) = watch.git_ignore
+                        && is_ignored(&path, g_ignore)
+                    {
+                        continue;
+                    }
+
+                    watch.files.insert(path);
+                }
 
                 trace!("Event for '{}'", watch.name);
 
@@ -75,13 +86,7 @@ impl WatchFiles {
     fn start_one(&mut self, item: WatchItem) -> Result<RecommendedWatcher> {
         trace!("Starting '{}'", item.name);
 
-        if let Some(ref base) = item.base_path {
-            std::env::set_current_dir(base)?;
-        }
-
-        let (paths, git_ignore) = get_all_paths(&item)?;
-        let watcher = ActiveWatcher::new(&item);
-        let id = Uuid::new_v4();
+        let (paths, git_ignore) = item.get_all_paths()?;
 
         trace!(
             "Paths - {:?}, gitignore: {}",
@@ -92,7 +97,10 @@ impl WatchFiles {
                 .unwrap_or_default()
         );
 
-        let handler = WatchEventHandler::new(id, item.events, self.sx.clone(), git_ignore);
+        let watcher = WatchCommandRunner::new(&item, git_ignore);
+        let id = Uuid::new_v4();
+
+        let handler = WatchEventHandler::new(id, item.events, self.sx.clone());
 
         self.watch_map.insert(id, watcher);
 
@@ -118,49 +126,37 @@ impl Default for WatchFiles {
     }
 }
 
-pub struct ActiveWatcher {
-    pub name: String,
-    pub cmd: String,
-    pub files: HashSet<PathBuf>,
-    last_send: Option<Instant>,
+#[derive(Default)]
+struct WatchCommandRunner {
+    name: String,
+    cmd: String,
+    files: HashSet<PathBuf>,
+    git_ignore: Option<Gitignore>,
     debounce: u64,
+    last_send: Option<Instant>,
 }
 
-impl ActiveWatcher {
-    fn new(item: &WatchItem) -> Self {
-        let cmd = item.run.to_string();
-        let name = item.name.clone();
-
+impl WatchCommandRunner {
+    fn new(item: &WatchItem, git_ignore: Option<Gitignore>) -> Self {
         Self {
-            cmd,
-            name,
-            files: HashSet::new(),
-            last_send: None,
+            name: item.name.clone(),
+            cmd: item.run.to_string(),
             debounce: item.debounce,
+            git_ignore,
+            ..Default::default()
         }
     }
 }
 
-pub struct WatchEventHandler {
-    pub id: Uuid,
+struct WatchEventHandler {
+    id: Uuid,
     pub flags: EventFlags,
     pub sx: Sender<WatchEvent>,
-    pub git_ignore: Option<Gitignore>,
 }
 
 impl WatchEventHandler {
-    pub fn new(
-        id: Uuid,
-        flags: EventFlags,
-        sx: Sender<WatchEvent>,
-        git_ignore: Option<Gitignore>,
-    ) -> Self {
-        Self {
-            id,
-            flags,
-            sx,
-            git_ignore,
-        }
+    fn new(id: Uuid, flags: EventFlags, sx: Sender<WatchEvent>) -> Self {
+        Self { id, flags, sx }
     }
 }
 
@@ -170,17 +166,8 @@ impl EventHandler for WatchEventHandler {
             Ok(Event { kind, paths, .. }) => {
                 let flag = EventFlags::from(kind);
 
-                let paths = if let Some(ref ignore) = self.git_ignore {
-                    paths
-                        .into_iter()
-                        .filter(|p| !ignore.matched(p, p.is_dir()).is_ignore())
-                        .collect()
-                } else {
-                    paths
-                };
-
                 if self.flags.intersects(flag) && !paths.is_empty() {
-                    self.sx.send((self.id, paths)).unwrap();
+                    self.sx.send(WatchEvent { id: self.id, paths }).unwrap();
                 }
             }
             Err(e) => error!("{}", e),
@@ -188,81 +175,7 @@ impl EventHandler for WatchEventHandler {
     }
 }
 
-fn get_all_paths(item: &WatchItem) -> Result<(Vec<PathBuf>, Option<Gitignore>)> {
-    let mut paths = HashSet::new();
-    let mut git_ignore: Option<GitignoreBuilder> = None;
-
-    match &item.watch {
-        YamlChoice::Single(s) => get_single_path(s, &mut paths, &mut git_ignore)?,
-        YamlChoice::Arr(arr) => get_multi_paths(arr, &mut paths, &mut git_ignore)?,
-    }
-
-    let paths: Vec<PathBuf> = if let Some(ign) = &item.ignore {
-        let mut ignored = HashSet::new();
-
-        match ign {
-            YamlChoice::Single(s) => get_single_path(s, &mut ignored, &mut git_ignore)?,
-            YamlChoice::Arr(arr) => get_multi_paths(arr, &mut ignored, &mut git_ignore)?,
-        }
-
-        paths.difference(&ignored).cloned().collect()
-    } else {
-        paths.into_iter().collect()
-    };
-
-    if let Some(ignore) = git_ignore
-        && let Ok(ignore) = ignore.build()
-    {
-        let filtered_paths = paths
-            .into_iter()
-            .filter(|path| !ignore.matched(path, path.is_dir()).is_ignore())
-            .collect();
-        Ok((filtered_paths, Some(ignore)))
-    } else {
-        Ok((paths, None))
-    }
-}
-
-fn get_multi_paths(
-    items: &[String],
-    paths: &mut HashSet<PathBuf>,
-    ignored: &mut Option<GitignoreBuilder>,
-) -> Result<()> {
-    for glob_path in items.iter() {
-        get_single_path(glob_path, paths, ignored)?;
-    }
-
-    Ok(())
-}
-
-fn get_single_path(
-    item: &str,
-    paths: &mut HashSet<PathBuf>,
-    ignored: &mut Option<GitignoreBuilder>,
-) -> Result<()> {
-    for path in glob(item)? {
-        let path = path?;
-
-        if let Some(f_name) = path.file_name().map(|s| s.to_string_lossy())
-            && f_name == ".gitignore"
-        {
-            let abs_path = path.canonicalize().unwrap();
-
-            let ignore =
-                ignored.get_or_insert_with(|| GitignoreBuilder::new(path.parent().unwrap()));
-
-            ignore.add(&abs_path);
-        } else if path.to_string_lossy().contains(".git") {
-            continue;
-        } else {
-            paths.insert(path);
-        }
-    }
-
-    Ok(())
-}
-
-fn run_command(watcher: &ActiveWatcher) -> Result<()> {
+fn run_command(watcher: &WatchCommandRunner) -> Result<()> {
     let files = watcher
         .files
         .iter()
